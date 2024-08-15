@@ -4,6 +4,7 @@ from lxml import html
 import numpy as np
 import pandas as pd
 import requests
+import json
 
 
 class RightmoveData:
@@ -16,7 +17,7 @@ class RightmoveData:
 
     The query to rightmove can be renewed by calling the `refresh_data` method.
     """
-    def __init__(self, url: str, get_floorplans: bool = False):
+    def __init__(self, url: str, get_floorplans: bool = False, get_json_data: bool = False):
         """Initialize the scraper with a URL from the results of a property
         search performed on www.rightmove.co.uk.
 
@@ -29,14 +30,14 @@ class RightmoveData:
         self._status_code, self._first_page = self._request(url)
         self._url = url
         self._validate_url()
-        self._results = self._get_results(get_floorplans=get_floorplans)
+        self._results = self._get_results(get_floorplans=get_floorplans, get_json_data=get_json_data)
 
     @staticmethod
     def _request(url: str):
         r = requests.get(url)
         return r.status_code, r.content
 
-    def refresh_data(self, url: str = None, get_floorplans: bool = False):
+    def refresh_data(self, url: str = None, get_floorplans: bool = False, get_json_data: bool = False):
         """Make a fresh GET request for the rightmove data.
 
         Args:
@@ -50,7 +51,7 @@ class RightmoveData:
         self._status_code, self._first_page = self._request(url)
         self._url = url
         self._validate_url()
-        self._results = self._get_results(get_floorplans=get_floorplans)
+        self._results = self._get_results(get_floorplans=get_floorplans, get_json_data=get_json_data)
 
     def _validate_url(self):
         """Basic validation that the URL at least starts in the right format and
@@ -148,7 +149,7 @@ class RightmoveData:
             page_count = 42
         return page_count
 
-    def _get_page(self, request_content: str, get_floorplans: bool = False):
+    def _get_page(self, request_content: str, get_floorplans: bool = False, get_json_data: bool = False):
         """Method to scrape data from a single page of search results. Used
         iteratively by the `get_results` method to scrape data from every page
         returned by the search."""
@@ -172,6 +173,8 @@ class RightmoveData:
         xp_agent_urls = """//div[@class="propertyCard-contactsItem"]\
         //div[@class="propertyCard-branchLogo"]\
         //a[@class="propertyCard-branchLogo-link"]/@href"""
+        xp_json_model = """//script[starts-with(text(), 'window.jsonModel = ')]/text()"""  # SA: get json data
+
 
         # Create data lists from xpaths:
         price_pcm = tree.xpath(xp_prices)
@@ -180,6 +183,7 @@ class RightmoveData:
         base = "http://www.rightmove.co.uk"
         weblinks = [f"{base}{tree.xpath(xp_weblinks)[w]}" for w in range(len(tree.xpath(xp_weblinks)))]
         agent_urls = [f"{base}{tree.xpath(xp_agent_urls)[a]}" for a in range(len(tree.xpath(xp_agent_urls)))]
+        json_model = tree.xpath(xp_json_model)  # SA: get json data
 
         # Optionally get floorplan links from property urls (longer runtime):
         floorplan_urls = list() if get_floorplans else np.nan
@@ -196,13 +200,25 @@ class RightmoveData:
                 else:
                     floorplan_urls.append(np.nan)
 
+        # Optionally get data from json model (longer runtime):
+        json_data = list() if get_json_data else np.nan
+        if get_json_data:
+            json_text = json_model[0].strip().split('window.jsonModel =', 1)[1].strip().rstrip(';')
+            json_object = json.loads(json_text)
+            for p in json_object['properties']:
+                nearest_postcode = self.find_nearest_postcode(p['location']['latitude'], p['location']['longitude'])
+                json_data.append([p['propertySubType'], p['displaySize'], p['summary'], p['location'], nearest_postcode])
+            json_data = [list(row) for row in zip(*json_data)]
+
         # Store the data in a Pandas DataFrame:
         data = [price_pcm, titles, addresses, weblinks, agent_urls]
         data = data + [floorplan_urls] if get_floorplans else data
+        data = data + json_data if get_json_data else data
         temp_df = pd.DataFrame(data)
         temp_df = temp_df.transpose()
         columns = ["price", "type", "address", "url", "agent_url"]
         columns = columns + ["floorplan_url"] if get_floorplans else columns
+        columns = columns + ["subtype", "floorsize_sqft", "summary", "location", "nearest_postcode"] if get_json_data else columns
         temp_df.columns = columns
 
         # Drop empty rows which come from placeholders in the html:
@@ -210,9 +226,9 @@ class RightmoveData:
 
         return temp_df
 
-    def _get_results(self, get_floorplans: bool = False):
+    def _get_results(self, get_floorplans: bool = False, get_json_data: bool = False):
         """Build a Pandas DataFrame with all results returned by the search."""
-        results = self._get_page(self._first_page, get_floorplans=get_floorplans)
+        results = self._get_page(self._first_page, get_floorplans=get_floorplans, get_json_data=get_json_data)
 
         # Iterate through all pages scraping results:
         for p in range(1, self.page_count + 1, 1):
@@ -228,13 +244,34 @@ class RightmoveData:
                 break
 
             # Create a temporary DataFrame of page results:
-            temp_df = self._get_page(content, get_floorplans=get_floorplans)
+            temp_df = self._get_page(content, get_floorplans=get_floorplans, get_json_data=get_json_data)
 
             # Concatenate the temporary DataFrame with the full DataFrame:
             frames = [results, temp_df]
             results = pd.concat(frames)
 
         return self._clean_results(results)
+
+    @staticmethod
+    def find_nearest_postcode(latitude, longitude):
+        """ Find the nearest UK postcode given latitude and longitude using the postcodes.io API """
+        url = f"https://api.postcodes.io/postcodes"
+        params = {
+            'lon': longitude,
+            'lat': latitude
+        }
+
+        response = requests.get(url, params=params)
+
+        if response.status_code == 200:
+            data = response.json()
+            if data['status'] == 200:
+                nearest_postcode = data['result'][0]['postcode']
+                return nearest_postcode
+            else:
+                raise ValueError(f"Error in response: {data['error']}")
+        else:
+            response.raise_for_status()
 
     @staticmethod
     def _clean_results(results: pd.DataFrame):
@@ -265,5 +302,14 @@ class RightmoveData:
         # Add column with datetime when the search was run (i.e. now):
         now = datetime.datetime.now()
         results["search_date"] = now
+
+        # remove newline characters in the address column
+        results["address"] = results["address"].str.replace('\n', '')
+
+        # Convert the floorsize column to numeric type:
+        if "floorsize_sqft" in results.columns:
+            results["floorsize_sqft"] = results["floorsize_sqft"].apply(
+                lambda x: np.nan if pd.isna(x) or x == '' else int(''.join(filter(str.isdigit, x)))
+            )
 
         return results
