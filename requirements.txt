@@ -2,3 +2,7 @@ lxml>=4.8.0
 numpy>=1.22.3
 pandas>=1.4.1
 requests>=2.27.1
+matplotlib>=3.10.0
+seaborn>=0.13.0
+scikit-learn>=1.6.0
+
