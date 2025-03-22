@@ -1,69 +1,50 @@
-
+# -*- coding: utf-8 -*-
 import datetime
-from lxml import html
-import numpy as np
-import pandas as pd
 import requests
 import json
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from lxml import html
+from sklearn.ensemble import IsolationForest
 
 
 class RightmoveData:
-    """The `RightmoveData` webscraper collects structured data on properties
-    returned by a search performed on www.rightmove.co.uk
-
-    An instance of the class provides attributes to access data from the search
-    results, the most useful being `get_results`, which returns all results as a
-    Pandas DataFrame object.
-
-    The query to rightmove can be renewed by calling the `refresh_data` method.
+    """The `RightmoveData` web scraper collects structured data on properties
+    returned by a search performed on www.rightmove.co.uk.
     """
-    def __init__(self, url: str, get_floorplans: bool = False, get_json_data: bool = False):
-        """Initialize the scraper with a URL from the results of a property
-        search performed on www.rightmove.co.uk.
 
-        Args:
-            url (str): full HTML link to a page of rightmove search results.
-            get_floorplans (bool): optionally scrape links to the individual
-                floor plan images for each listing (be warned this drastically
-                increases runtime so is False by default).
-        """
-        self._status_code, self._first_page = self._request(url)
+    def __init__(self, url: str, get_floorplans: bool = False, get_json_data: bool = False):
+        """Initialize the scraper with a URL from the results of a property search."""
         self._url = url
+        self._status_code, self._first_page = self._request(url)
         self._validate_url()
         self._results = self._get_results(get_floorplans=get_floorplans, get_json_data=get_json_data)
 
     @staticmethod
     def _request(url: str):
-        r = requests.get(url)
-        return r.status_code, r.content
+        """Send GET request and return the status code and content."""
+        return requests.get(url).status_code, requests.get(url).content
 
     def refresh_data(self, url: str = None, get_floorplans: bool = False, get_json_data: bool = False):
-        """Make a fresh GET request for the rightmove data.
-
-        Args:
-            url (str): optionally pass a new HTML link to a page of rightmove
-                search results (else defaults to the current `url` attribute).
-            get_floorplans (bool): optionally scrape links to the individual
-                flooplan images for each listing (this drastically increases
-                runtime so is False by default).
-        """
-        url = self.url if not url else url
+        """Make a fresh GET request to refresh the data."""
+        url = url or self._url  # If no new URL, use the existing one
         self._status_code, self._first_page = self._request(url)
         self._url = url
         self._validate_url()
-        self._results = self._get_results(get_floorplans=get_floorplans, get_json_data=get_json_data)
+        self._results = self._get_results(get_floorplans, get_json_data)
 
     def _validate_url(self):
-        """Basic validation that the URL at least starts in the right format and
-        returns status code 200."""
-        real_url = "{}://www.rightmove.co.uk/{}/find.html?"
-        protocols = ["http", "https"]
-        types = ["property-to-rent", "property-for-sale", "new-homes-for-sale"]
-        urls = [real_url.format(p, t) for p in protocols for t in types]
-        conditions = [self.url.startswith(u) for u in urls]
-        conditions.append(self._status_code == 200)
-        if not any(conditions):
-            raise ValueError(f"Invalid rightmove search URL:\n\n\t{self.url}")
+        """Validate that the URL is from Rightmove and returns a valid status code."""
+        valid_protocols = ["http", "https"]
+        valid_types = ["property-to-rent", "property-for-sale", "new-homes-for-sale"]
+        valid_urls = [f"{protocol}://www.rightmove.co.uk/{type}/find.html?" for protocol in valid_protocols for type in
+                      valid_types]
+
+        if not any(self._url.startswith(url) for url in valid_urls) or self._status_code != 200:
+            raise ValueError(f"Invalid Rightmove URL:\n\n\t{self._url}")
 
     @property
     def url(self):
@@ -71,245 +52,264 @@ class RightmoveData:
 
     @property
     def get_results(self):
-        """Pandas DataFrame of all results returned by the search."""
+        """Return the results as a Pandas DataFrame."""
         return self._results
 
     @property
     def results_count(self):
-        """Total number of results returned by `get_results`. Note that the
-        rightmove website may state a much higher number of results; this is
-        because they artificially restrict the number of results pages that can
-        be accessed to 42."""
+        """Get the number of results."""
         return len(self.get_results)
 
     @property
     def average_price(self):
-        """Average price of all results returned by `get_results` (ignoring
-        results which don't list a price)."""
-        total = self.get_results["price"].dropna().sum()
-        return total / self.results_count
+        """Get the average price of the results, ignoring null prices."""
+        return self.get_results["price"].dropna().mean()
 
-    def summary(self, by: str = None):
-        """DataFrame summarising results by mean price and count. Defaults to
-        grouping by `number_bedrooms` (residential) or `type` (commercial), but
-        accepts any column name from `get_results` as a grouper.
+    def summary_stats(self, by: str = None):
+        """Summary statistics of the results, grouped by a column (e.g., 'number_bedrooms').
 
-        Args:
-            by (str): valid column name from `get_results` DataFrame attribute.
+        Includes count, mean, median, std, min, and max for the price column.
         """
-        if not by:
-            by = "type" if "commercial" in self.rent_or_sale else "number_bedrooms"
+        # Default to 'type' for commercial properties, 'number_bedrooms' for residential
+        by = by or ("type" if "commercial" in self.rent_or_sale else "number_bedrooms")
         assert by in self.get_results.columns, f"Column not found in `get_results`: {by}"
-        df = self.get_results.dropna(axis=0, subset=["price"])
-        groupers = {"price": ["count", "mean"]}
-        df = df.groupby(df[by]).agg(groupers)
-        df.columns = df.columns.get_level_values(1)
-        df.reset_index(inplace=True)
-        if "number_bedrooms" in df.columns:
-            df["number_bedrooms"] = df["number_bedrooms"].astype(int)
-            df.sort_values(by=["number_bedrooms"], inplace=True)
+
+        # Drop rows where 'price' is missing
+        df = self.get_results.dropna(subset=["price"])
+
+        # Group by the specified column and calculate various statistics for 'price'
+        summary = df.groupby(by)["price"].agg(
+            count="count",
+            mean="mean",
+            median="median",
+            std="std",
+            min="min",
+            max="max"
+        ).reset_index()
+
+        # Sort by number of bedrooms or count for commercial properties
+        if "number_bedrooms" in summary.columns:
+            summary["number_bedrooms"] = summary["number_bedrooms"].astype(int)
+            summary.sort_values(by="number_bedrooms", inplace=True)
         else:
-            df.sort_values(by=["count"], inplace=True, ascending=False)
-        return df.reset_index(drop=True)
+            summary.sort_values(by="count", ascending=False, inplace=True)
+
+        return summary
 
     @property
     def rent_or_sale(self):
-        """String specifying if the search is for properties for rent or sale.
-        Required because Xpaths are different for the target elements."""
-        if "/property-for-sale/" in self.url or "/new-homes-for-sale/" in self.url:
+        """Return whether the search is for rent or sale properties."""
+        if "/property-for-sale/" in self._url or "/new-homes-for-sale/" in self._url:
             return "sale"
-        elif "/property-to-rent/" in self.url:
+        elif "/property-to-rent/" in self._url:
             return "rent"
-        elif "/commercial-property-for-sale/" in self.url:
+        elif "/commercial-property-for-sale/" in self._url:
             return "sale-commercial"
-        elif "/commercial-property-to-let/" in self.url:
+        elif "/commercial-property-to-let/" in self._url:
             return "rent-commercial"
         else:
-            raise ValueError(f"Invalid rightmove URL:\n\n\t{self.url}")
+            raise ValueError(f"Invalid Rightmove URL:\n\n\t{self._url}")
 
     @property
     def results_count_display(self):
-        """Returns an integer of the total number of listings as displayed on
-        the first page of results. Note that not all listings are available to
-        scrape because rightmove limits the number of accessible pages."""
+        """Get the number of listings displayed on the first page."""
         tree = html.fromstring(self._first_page)
-        xpath = """//span[@class="searchHeader-resultCount"]/text()"""
+        xpath = "//span[@class='searchHeader-resultCount']/text()"
         return int(tree.xpath(xpath)[0].replace(",", ""))
 
     @property
     def page_count(self):
-        """Returns the number of result pages returned by the search URL. There
-        are 24 results per page. Note that the website limits results to a
-        maximum of 42 accessible pages."""
-        page_count = self.results_count_display // 24
-        if self.results_count_display % 24 > 0:
-            page_count += 1
-        # Rightmove will return a maximum of 42 results pages, hence:
-        if page_count > 42:
-            page_count = 42
-        return page_count
+        """Get the total number of pages of results."""
+        pages = self.results_count_display // 24 + (1 if self.results_count_display % 24 else 0)
+        return min(pages, 42)  # Limit to 42 pages
 
     def _get_page(self, request_content: str, get_floorplans: bool = False, get_json_data: bool = False):
-        """Method to scrape data from a single page of search results. Used
-        iteratively by the `get_results` method to scrape data from every page
-        returned by the search."""
-        # Process the html:
+        """Scrape a single page of results."""
         tree = html.fromstring(request_content)
 
-        # Set xpath for price:
-        if "rent" in self.rent_or_sale:
-            xp_prices = """//span[@class="propertyCard-priceValue"]/text()"""
-        elif "sale" in self.rent_or_sale:
-            xp_prices = """//div[@class="propertyCard-priceValue"]/text()"""
-        else:
-            raise ValueError("Invalid URL format.")
+        # Define xpaths based on property type
+        xp_prices = "//span[@class='propertyCard-priceValue']/text()" if "rent" in self.rent_or_sale else "//div[@class='propertyCard-priceValue']/text()"
+        xp_titles = "//div[@class='propertyCard-details']//a[@class='propertyCard-link']//h2[@class='propertyCard-title']/text()"
+        xp_addresses = "//address[@class='propertyCard-address']//span/text()"
+        xp_weblinks = "//div[@class='propertyCard-details']//a[@class='propertyCard-link']/@href"
+        xp_agent_urls = "//div[@class='propertyCard-contactsItem']//div[@class='propertyCard-branchLogo']//a[@class='propertyCard-branchLogo-link']/@href"
+        xp_json_model = "//script[starts-with(text(), 'window.jsonModel = ')]/text()"
 
-        # Set xpaths for listing title, property address, URL, and agent URL:
-        xp_titles = """//div[@class="propertyCard-details"]\
-        //a[@class="propertyCard-link"]\
-        //h2[@class="propertyCard-title"]/text()"""
-        xp_addresses = """//address[@class="propertyCard-address"]//span/text()"""
-        xp_weblinks = """//div[@class="propertyCard-details"]//a[@class="propertyCard-link"]/@href"""
-        xp_agent_urls = """//div[@class="propertyCard-contactsItem"]\
-        //div[@class="propertyCard-branchLogo"]\
-        //a[@class="propertyCard-branchLogo-link"]/@href"""
-        xp_json_model = """//script[starts-with(text(), 'window.jsonModel = ')]/text()"""  # SA: get json data
-
-
-        # Create data lists from xpaths:
+        # Extract data using xpaths
         price_pcm = tree.xpath(xp_prices)
         titles = tree.xpath(xp_titles)
         addresses = tree.xpath(xp_addresses)
-        base = "http://www.rightmove.co.uk"
-        weblinks = [f"{base}{tree.xpath(xp_weblinks)[w]}" for w in range(len(tree.xpath(xp_weblinks)))]
-        agent_urls = [f"{base}{tree.xpath(xp_agent_urls)[a]}" for a in range(len(tree.xpath(xp_agent_urls)))]
-        json_model = tree.xpath(xp_json_model)  # SA: get json data
+        weblinks = [f"http://www.rightmove.co.uk{link}" for link in tree.xpath(xp_weblinks)]
+        agent_urls = [f"http://www.rightmove.co.uk{link}" for link in tree.xpath(xp_agent_urls)]
+        json_model = tree.xpath(xp_json_model)
 
-        # Optionally get floorplan links from property urls (longer runtime):
-        floorplan_urls = list() if get_floorplans else np.nan
-        if get_floorplans:
-            for weblink in weblinks:
-                status_code, content = self._request(weblink)
-                if status_code != 200:
-                    continue
-                tree = html.fromstring(content)
-                xp_floorplan_url = """//*[@id="floorplanTabs"]/div[2]/div[2]/img/@src"""
-                floorplan_url = tree.xpath(xp_floorplan_url)
-                if floorplan_url:
-                    floorplan_urls.append(floorplan_url[0])
-                else:
-                    floorplan_urls.append(np.nan)
+        # Optionally scrape floorplan links and JSON data
+        floorplan_urls = self._get_floorplans(weblinks) if get_floorplans else []
+        json_data = self._get_json_data(json_model) if get_json_data else []
 
-        # Optionally get data from json model (longer runtime):
-        json_data = list() if get_json_data else np.nan
-        if get_json_data:
-            json_text = json_model[0].strip().split('window.jsonModel =', 1)[1].strip().rstrip(';')
-            json_object = json.loads(json_text)
-            for p in json_object['properties']:
-                nearest_postcode = self.find_nearest_postcode(p['location']['latitude'], p['location']['longitude'])
-                json_data.append([p['propertySubType'], p['displaySize'], p['summary'], p['location'], nearest_postcode])
-            json_data = [list(row) for row in zip(*json_data)]
 
-        # Store the data in a Pandas DataFrame:
-        data = [price_pcm, titles, addresses, weblinks, agent_urls]
-        data = data + [floorplan_urls] if get_floorplans else data
-        data = data + json_data if get_json_data else data
-        temp_df = pd.DataFrame(data)
-        temp_df = temp_df.transpose()
+        # Define columns dynamically
         columns = ["price", "type", "address", "url", "agent_url"]
-        columns = columns + ["floorplan_url"] if get_floorplans else columns
-        columns = columns + ["subtype", "floorsize_sqft", "summary", "location", "nearest_postcode"] if get_json_data else columns
-        temp_df.columns = columns
 
-        # Drop empty rows which come from placeholders in the html:
-        temp_df = temp_df[temp_df["address"].notnull()]
+        # Combine all data into a list
+        data = [price_pcm, titles, addresses, weblinks, agent_urls]
 
-        return temp_df
+        # Add 'floorplan_url' if get_floorplans is True
+        if get_floorplans:
+            data.append(floorplan_urls)
+            columns.append("floorplan_url")
+
+        # Add JSON-related columns if get_json_data is True
+        if get_json_data:
+            data += json_data
+            columns += ["subtype", "floorsize_sqft", "summary", "location", "nearest_postcode"]
+
+        # Create DataFrame after defining all data and column names
+        df = pd.DataFrame(data).transpose()
+
+        # Assign the column names to the DataFrame
+        df.columns = columns
+
+        return df[df["address"].notnull()]
+
+    def _get_floorplans(self, weblinks: list):
+        """Scrape floorplan links from individual property pages."""
+        floorplan_urls = []
+        for weblink in weblinks:
+            status_code, content = self._request(weblink)
+            if status_code == 200:
+                tree = html.fromstring(content)
+                xp_floorplan_url = "//*[@id='floorplanTabs']/div[2]/div[2]/img/@src"
+                floorplan_urls.append(tree.xpath(xp_floorplan_url)[0] if tree.xpath(xp_floorplan_url) else np.nan)
+        return floorplan_urls
+
+    def _get_json_data(self, json_model: list):
+        """Extract JSON data from the model."""
+        if json_model:
+            json_text = json_model[0].split('window.jsonModel =', 1)[1].strip().rstrip(';')
+            json_object = json.loads(json_text)
+            json_data = [
+                [p['propertySubType'], p['displaySize'], p['summary'], p['location']] + [
+                    self.find_nearest_postcode(p['location']['latitude'], p['location']['longitude'])
+                ] for p in json_object['properties']
+            ]
+            # Transpose the data so each attribute is in its own list (columns)
+            json_data = [list(row) for row in zip(*json_data)]  # Transpose the list of lists
+            return json_data
+        return []
 
     def _get_results(self, get_floorplans: bool = False, get_json_data: bool = False):
-        """Build a Pandas DataFrame with all results returned by the search."""
-        results = self._get_page(self._first_page, get_floorplans=get_floorplans, get_json_data=get_json_data)
-
-        # Iterate through all pages scraping results:
-        for p in range(1, self.page_count + 1, 1):
-
-            # Create the URL of the specific results page:
-            p_url = f"{str(self.url)}&index={p * 24}"
-
-            # Make the request:
+        """Scrape results from all pages and return them as a DataFrame."""
+        results = self._get_page(self._first_page, get_floorplans, get_json_data)
+        for p in range(1, self.page_count + 1):
+            p_url = f"{self._url}&index={p * 24}"
             status_code, content = self._request(p_url)
-
-            # Requests to scrape lots of pages eventually get status 400, so:
-            if status_code != 200:
-                break
-
-            # Create a temporary DataFrame of page results:
-            temp_df = self._get_page(content, get_floorplans=get_floorplans, get_json_data=get_json_data)
-
-            # Concatenate the temporary DataFrame with the full DataFrame:
-            frames = [results, temp_df]
-            results = pd.concat(frames)
-
+            if status_code == 200:
+                temp_df = self._get_page(content, get_floorplans, get_json_data)
+                results = pd.concat([results, temp_df])
         return self._clean_results(results)
 
     @staticmethod
     def find_nearest_postcode(latitude, longitude):
-        """ Find the nearest UK postcode given latitude and longitude using the postcodes.io API """
-        url = f"https://api.postcodes.io/postcodes"
-        params = {
-            'lon': longitude,
-            'lat': latitude
-        }
+        """Find the nearest UK postcode based on latitude and longitude."""
+        url = "https://api.postcodes.io/postcodes"
+        params = {'lat': latitude, 'lon': longitude}
 
-        response = requests.get(url, params=params)
-
-        if response.status_code == 200:
+        try:
+            response = requests.get(url, params=params, timeout=5)
+            response.raise_for_status()
             data = response.json()
-            if data['status'] == 200:
-                nearest_postcode = data['result'][0]['postcode']
-                return nearest_postcode
+
+            if data.get('status') == 200:
+                result = data.get('result')
+                if result:
+                    return result[0].get('postcode')
+                else:
+                    # No postcode found; return None.
+                    return None
             else:
                 raise ValueError(f"Error in response: {data['error']}")
-        else:
-            response.raise_for_status()
+
+        except requests.exceptions.Timeout:
+            return None
 
     @staticmethod
     def _clean_results(results: pd.DataFrame):
-        # Reset the index:
-        results.reset_index(inplace=True, drop=True)
+        """Clean and format the results DataFrame."""
+        # Convert price to numeric, remove non-numeric characters
+        results["price"] = pd.to_numeric(results["price"].replace(regex=True, to_replace=r"\D", value=""))
 
-        # Convert price column to numeric type:
-        results["price"].replace(regex=True, inplace=True, to_replace=r"\D", value=r"")
-        results["price"] = pd.to_numeric(results["price"])
+        # Extract postcode, bedroom count, and other useful data
+        results["postcode"] = results["address"].str.extract(r"\b([A-Za-z][A-Za-z]?[0-9][0-9]?[A-Za-z]?)\b")
+        results["full_postcode"] = results["address"].str.extract(
+            r"([A-Za-z][A-Za-z]?[0-9][0-9]?[A-Za-z]?[0-9]?\s[0-9]?[A-Za-z][A-Za-z])")
+        results["number_bedrooms"] = results["type"].str.extract(r"\b([\d][\d]?)\b").astype(float)
+        results["type"] = results["type"].str.strip()
 
-        # Extract short postcode area to a separate column:
-        pat = r"\b([A-Za-z][A-Za-z]?[0-9][0-9]?[A-Za-z]?)\b"
-        results["postcode"] = results["address"].astype(str).str.extract(pat, expand=True)[0]
+        # Add search date
+        results["search_date"] = datetime.datetime.now()
 
-        # Extract full postcode to a separate column:
-        pat = r"([A-Za-z][A-Za-z]?[0-9][0-9]?[A-Za-z]?[0-9]?\s[0-9]?[A-Za-z][A-Za-z])"
-        results["full_postcode"] = results["address"].astype(str).str.extract(pat, expand=True)[0]
-
-        # Extract number of bedrooms from `type` to a separate column:
-        pat = r"\b([\d][\d]?)\b"
-        results["number_bedrooms"] = results["type"].astype(str).str.extract(pat, expand=True)[0]
-        results.loc[results["type"].str.contains("studio", case=False), "number_bedrooms"] = 0
-        results["number_bedrooms"] = pd.to_numeric(results["number_bedrooms"])
-
-        # Clean up annoying white spaces and newlines in `type` column:
-        results["type"] = results["type"].str.strip("\n").str.strip()
-
-        # Add column with datetime when the search was run (i.e. now):
-        now = datetime.datetime.now()
-        results["search_date"] = now
-
-        # remove newline characters in the address column
-        results["address"] = results["address"].str.replace('\n', '')
-
-        # Convert the floorsize column to numeric type:
+        # Handle floorsize as numeric, calculate price per square foot
         if "floorsize_sqft" in results.columns:
-            results["floorsize_sqft"] = results["floorsize_sqft"].apply(
-                lambda x: np.nan if pd.isna(x) or x == '' else int(''.join(filter(str.isdigit, x)))
-            )
+            results["floorsize_sqft"] = pd.to_numeric(results["floorsize_sqft"].str.replace(r"\D", "", regex=True),
+                                                      errors="coerce")
+            results["price_per_sqft"] = results["price"] / results["floorsize_sqft"]
 
-        return results
+        # Return the cleaned DataFrame
+        return results.reset_index(drop=True)
+
+    def plot_price_distribution(self):
+        """Plot the distribution of property prices using self.get_results."""
+        df = self.get_results  # Use self.get_results as the DataFrame
+
+        # Check if the 'price' column exists in the DataFrame
+        if "price" not in df.columns:
+            print("Error: 'price' column not found in the data.")
+            return
+
+        plt.figure(figsize=(10, 6))
+        df['price'].hist(bins=20, edgecolor='black')
+        plt.title('Price Distribution of Properties')
+        plt.xlabel('Price')
+        plt.ylabel('Frequency')
+        plt.show()
+
+    def complete_stats(self):
+        """Generates summary statistics and visualizations for the data stored in self.get_results."""
+        df = self.get_results  # Use self.get_results as the DataFrame
+
+        # 1. Descriptive Statistics
+        summary_statistics = df.describe(include='all')
+        print("Summary Statistics:")
+        print(summary_statistics)
+
+        # Including mode (most frequent value)
+        mode_values = df.mode().iloc[0]
+        print("\nMode values:")
+        print(mode_values)
+
+        # 2. Histograms for each numerical column
+        num_cols = df.select_dtypes(include=np.number).columns
+        df[num_cols].hist(figsize=(10, 8), bins=20)
+        plt.suptitle('Histograms')
+        plt.show()
+
+        # 3. Boxplots for each numerical column
+        plt.figure(figsize=(10, 6))
+        df[num_cols].boxplot()
+        plt.title('Boxplots')
+        plt.show()
+
+        # 4. Scatter plots for relationships between numerical variables
+        sns.pairplot(df[num_cols])
+        plt.suptitle('Scatter Plots', y=1.02)
+        plt.show()
+
+        # 5. Correlation matrix and heatmap
+        if len(num_cols) > 1:  # Only plot if there are at least 2 numerical columns
+            correlation_matrix = df[num_cols].corr()
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1)
+            plt.title('Correlation Matrix Heatmap')
+            plt.show()
+
